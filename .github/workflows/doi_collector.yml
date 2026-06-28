@@ -1,14 +1,14 @@
-name: DOI Collector
+name: DOI Collector - Zyntra Research
 
 on:
   schedule:
-    - cron: "0 */6 * * *"  # Her 6 saatte bir
-  workflow_dispatch:           # Elle de tetiklenebilir
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 300       # 5 saat max
+    timeout-minutes: 300
 
     steps:
       - uses: actions/checkout@v4
@@ -21,12 +21,12 @@ jobs:
         run: pip install httpx
 
       - name: DOI Collector calistir
-        run: python scripts/doi_collector_colab.py
+        run: python scripts/doi_collector_github.py
 
       - name: Sonuclari commit et
         run: |
           git config user.name "zyntra-bot"
-          git config user.email "zyntra-automation@colab-erisim.iam.gserviceaccount.com"
+          git config user.email "bot@zyntra.ai"
           git add -A
-          git diff --staged --quiet || git commit -m "DOI update - $(date +%Y-%m-%d-%H%M)"
+          git diff --staged --quiet || git commit -m "DOI update $(date +%Y-%m-%d-%H%M) - $(cat data/summary.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(d["total_doi"])+ " DOI")' 2>/dev/null || echo '')"
           git push
