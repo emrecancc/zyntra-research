@@ -1,16 +1,18 @@
 """
-doi_collector_github.py — GitHub Actions'ta bagimsiz calisir.
-Bagimlilik: sadece httpx (pip install httpx)
-Cikti: data/_master.jsonl + data/progress.json
+doi_collector_github.py — GitHub Actions checkpoint'li DOI toplayici.
+- Her 30 dakikada bir calisir (workflow_dispatch veya cron)
+- 25 dakika calistiktan sonra timeout ile kesilir
+- Checkpoint'li: kaldigi yerden devam eder
+- Her 100 DOI'de summary.json gunceller (commit icin)
 """
-import asyncio, json, time, logging, os, sys
+import asyncio, json, time, logging, os, signal, sys
 from pathlib import Path
 import httpx
 
-# GitHub Actions ortaminda calis
 DATA_DIR    = Path("data")
 MASTER_FILE = DATA_DIR / "_master.jsonl"
 PROGRESS    = DATA_DIR / "progress.json"
+SUMMARY     = DATA_DIR / "summary.json"
 LOG_FILE    = DATA_DIR / "collector.log"
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -18,6 +20,10 @@ OA_EMAIL   = "emrecancerli55@gmail.com"
 OA_HEADERS = {"User-Agent": f"ZyntraResearch/3.0 (mailto:{OA_EMAIL})"}
 PER_PAGE   = 200
 MAX_PAGES  = 50
+
+# 23 dakika sonra dur (workflow 28dk timeout, bize 5dk commit icin kalir)
+HARD_STOP  = time.time() + 23 * 60
+_shutdown  = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("doi")
 
-# Taxonomy'den sorgu uret
+# ── Taxonomy ─────────────────────────────────────────────────
 def load_queries():
     tax_file = Path("Rocket/research_taxonomy.json")
     if not tax_file.exists():
@@ -38,18 +44,18 @@ def load_queries():
     tax = json.loads(tax_file.read_text(encoding="utf-8-sig"))
     queries = []
     for disc_key, disc in tax.get("disciplines", {}).items():
-        if disc.get("deferred_fulltext"):
-            continue
+        if disc.get("deferred_fulltext"): continue
         for sub_key, sub in disc.get("subtopics", {}).items():
             if "papers" in sub.get("sources", []):
                 for q in sub.get("queries", []):
                     queries.append((disc_key, sub_key, q))
     return queries
 
-# DOI Store
+# ── Store ────────────────────────────────────────────────────
 _seen = set()
 _progress = {}
 _master_f = None
+_new_this_run = 0
 
 def _load():
     global _seen, _progress
@@ -65,7 +71,7 @@ def _load():
     log.info(f"Progress: {done}/{len(_progress)} tamamlanmis")
 
 def _append(doi_obj, disc, sub):
-    global _master_f
+    global _master_f, _new_this_run
     doi = doi_obj.get("doi", "").strip()
     if not doi or doi in _seen: return False
     _seen.add(doi)
@@ -74,21 +80,40 @@ def _append(doi_obj, disc, sub):
         _master_f = open(MASTER_FILE, "a", encoding="utf-8")
     _master_f.write(rec + "\n")
     _master_f.flush()
+    _new_this_run += 1
+    # Her 100 DOI'de summary guncelle
+    if _new_this_run % 100 == 0:
+        _save_summary()
     return True
 
 def _save_progress():
-    PROGRESS.write_text(json.dumps(_progress), encoding="utf-8")
+    PROGRESS.write_text(json.dumps(_progress))
 
 def _mark_done(key):
     _progress[key] = True
-    _save_progress()
+    if sum(1 for v in _progress.values() if v) % 10 == 0:
+        _save_progress()
 
-# OpenAlex
+def _save_summary():
+    SUMMARY.write_text(json.dumps({
+        "run_time": time.strftime("%Y-%m-%d %H:%M UTC"),
+        "total_doi": len(_seen),
+        "new_this_run": _new_this_run,
+        "queries_done": sum(1 for v in _progress.values() if v),
+        "queries_total": len(_progress),
+    }, indent=2))
+
+def _time_ok():
+    return time.time() < HARD_STOP and not _shutdown
+
+# ── OpenAlex ─────────────────────────────────────────────────
 async def fetch_oa(client, query, disc, sub):
+    if not _time_ok(): return 0
     key = f"OA::{disc}::{sub}::{query[:40]}"
     if _progress.get(key): return 0
     cursor, new = "*", 0
     for page in range(MAX_PAGES):
+        if not _time_ok(): break
         url = (f"https://api.openalex.org/works"
                f"?search={query.replace(' ','+')}&per-page={PER_PAGE}"
                f"&cursor={cursor}&select=doi,title,abstract_inverted_index,"
@@ -98,8 +123,7 @@ async def fetch_oa(client, query, disc, sub):
             try:
                 r = await client.get(url, headers=OA_HEADERS, timeout=30)
                 if r.status_code == 429:
-                    log.warning(f"OA-429 [{query[:25]}] — 60s bekle")
-                    await asyncio.sleep(60); continue
+                    await asyncio.sleep(30); continue
                 if r.status_code != 200: _mark_done(key); return new
                 data = r.json()
                 results = data.get("results", [])
@@ -117,7 +141,7 @@ async def fetch_oa(client, query, disc, sub):
                     oa  = w.get("open_access") or {}
                     auths = [a.get("author", {}).get("display_name", "") for a in (w.get("authorships") or [])][:8]
                     concepts = [c.get("display_name", "") for c in (w.get("concepts") or [])][:5]
-                    obj = {
+                    _append({
                         "doi": raw, "title": (w.get("title") or "")[:500],
                         "abstract": abstract[:2000], "authors": auths,
                         "year": w.get("publication_year"),
@@ -126,32 +150,30 @@ async def fetch_oa(client, query, disc, sub):
                         "is_oa": oa.get("is_oa", False), "oa_url": oa.get("oa_url", ""),
                         "ref_count": w.get("referenced_works_count", 0),
                         "language": w.get("language", ""), "source": "openalex",
-                    }
-                    if _append(obj, disc, sub): new += 1
-                meta = data.get("meta", {})
-                cursor = meta.get("next_cursor", "")
+                    }, disc, sub)
+                    new += 1
+                cursor = data.get("meta", {}).get("next_cursor", "")
                 if not cursor: _mark_done(key); return new
                 break
             except Exception as e:
-                log.warning(f"OA-ERR [{query[:25]}] p{page}: {e}")
-                await asyncio.sleep(15)
-        await asyncio.sleep(0.5)
+                await asyncio.sleep(10)
+        await asyncio.sleep(0.3)
     _mark_done(key)
     return new
 
-# Crossref
+# ── Crossref ─────────────────────────────────────────────────
 async def fetch_cr(client, query, disc, sub):
+    if not _time_ok(): return 0
     key = f"CR::{disc}::{sub}::{query[:40]}"
     if _progress.get(key): return 0
     new, offset = 0, 0
-    while offset <= 4000:
+    while offset <= 4000 and _time_ok():
         url = (f"https://api.crossref.org/works"
                f"?query={query.replace(' ','+')}&rows=200&offset={offset}&mailto={OA_EMAIL}")
         for attempt in range(3):
             try:
                 r = await client.get(url, timeout=30)
-                if r.status_code == 429:
-                    await asyncio.sleep(30); continue
+                if r.status_code == 429: await asyncio.sleep(20); continue
                 if r.status_code != 200: _mark_done(key); return new
                 items = r.json().get("message", {}).get("items", [])
                 if not items: _mark_done(key); return new
@@ -162,41 +184,40 @@ async def fetch_cr(client, query, disc, sub):
                     auths = [f"{a.get('given','')} {a.get('family','')}".strip()
                              for a in (item.get("author") or [])][:8]
                     issued = (item.get("issued", {}).get("date-parts") or [[None]])[0]
-                    year = issued[0] if issued else None
-                    journal = (item.get("container-title") or [""])[0][:200]
-                    obj = {
+                    _append({
                         "doi": raw, "title": (titles[0] if titles else "")[:500],
                         "abstract": (item.get("abstract") or "")[:2000], "authors": auths,
-                        "year": year, "journal": journal,
+                        "year": issued[0] if issued else None,
+                        "journal": (item.get("container-title") or [""])[0][:200],
                         "cited_by": item.get("is-referenced-by-count", 0),
                         "concepts": [], "is_oa": False, "oa_url": "",
                         "ref_count": item.get("references-count", 0),
                         "language": "", "source": "crossref",
-                    }
-                    if _append(obj, disc, sub): new += 1
+                    }, disc, sub)
+                    new += 1
                 break
             except Exception as e:
-                log.warning(f"CR-ERR [{query[:25]}] off={offset}: {e}")
-                await asyncio.sleep(15)
+                await asyncio.sleep(10)
         offset += 200
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
     _mark_done(key)
     return new
 
-# EuropePMC
+# ── EuropePMC ─────────────────────────────────────────────────
 async def fetch_epmc(client, query, disc, sub):
+    if not _time_ok(): return 0
     key = f"EPMC::{disc}::{sub}::{query[:40]}"
     if _progress.get(key): return 0
     new, cursor = 0, "*"
     for page in range(15):
+        if not _time_ok(): break
         url = (f"https://www.ebi.ac.uk/europepmc/webservices/rest/search"
                f"?query={query.replace(' ','+')}&format=json&pageSize=200"
                f"&cursorMark={cursor}&resultType=core&sort=CITED+desc")
         for attempt in range(3):
             try:
                 r = await client.get(url, timeout=30)
-                if r.status_code == 429:
-                    await asyncio.sleep(30); continue
+                if r.status_code == 429: await asyncio.sleep(20); continue
                 if r.status_code != 200: _mark_done(key); return new
                 data = r.json()
                 results = data.get("resultList", {}).get("result", [])
@@ -206,7 +227,7 @@ async def fetch_epmc(client, query, disc, sub):
                     if not raw: continue
                     auths = [a.get("fullName", "") for a in
                              (item.get("authorList", {}).get("author") or [])][:8]
-                    obj = {
+                    _append({
                         "doi": raw, "title": (item.get("title") or "")[:500],
                         "abstract": (item.get("abstractText") or "")[:2000],
                         "authors": auths, "year": item.get("pubYear"),
@@ -214,117 +235,132 @@ async def fetch_epmc(client, query, disc, sub):
                         "cited_by": item.get("citedByCount", 0),
                         "concepts": [], "is_oa": item.get("isOpenAccess", "N") == "Y",
                         "oa_url": "", "ref_count": 0, "language": "", "source": "europepmc",
-                    }
-                    if _append(obj, disc, sub): new += 1
+                    }, disc, sub)
+                    new += 1
                 next_c = data.get("nextCursorMark", "")
                 if not next_c or next_c == cursor: _mark_done(key); return new
                 cursor = next_c
                 break
             except Exception as e:
-                log.warning(f"EPMC-ERR [{query[:25]}] p{page}: {e}")
-                await asyncio.sleep(15)
-        await asyncio.sleep(0.5)
+                await asyncio.sleep(10)
+        await asyncio.sleep(0.3)
     _mark_done(key)
     return new
 
-# Semantic Scholar
+# ── Semantic Scholar ──────────────────────────────────────────
 async def fetch_s2(client, query, disc, sub):
+    if not _time_ok(): return 0
     key = f"S2::{disc}::{sub}::{query[:40]}"
     if _progress.get(key): return 0
     new, offset = 0, 0
     fields = "externalIds,title,abstract,year,authors,citationCount,openAccessPdf,publicationVenue"
-    while offset <= 1900:
+    while offset <= 900 and _time_ok():
         url = (f"https://api.semanticscholar.org/graph/v1/paper/search"
                f"?query={query.replace(' ','+')}&offset={offset}&limit=100&fields={fields}")
         for attempt in range(3):
             try:
                 r = await client.get(url, timeout=30)
-                if r.status_code == 429:
-                    await asyncio.sleep(60); continue
+                if r.status_code == 429: await asyncio.sleep(60); continue
                 if r.status_code != 200: _mark_done(key); return new
-                data = r.json()
-                papers = data.get("data", [])
+                papers = r.json().get("data", [])
                 if not papers: _mark_done(key); return new
                 for paper in papers:
                     ext = paper.get("externalIds") or {}
                     raw = (ext.get("DOI") or "").strip()
                     if not raw: continue
-                    auths = [a.get("name", "") for a in (paper.get("authors") or [])][:8]
                     venue = paper.get("publicationVenue") or {}
                     oa_pdf = paper.get("openAccessPdf") or {}
-                    obj = {
+                    _append({
                         "doi": raw, "title": (paper.get("title") or "")[:500],
                         "abstract": (paper.get("abstract") or "")[:2000],
-                        "authors": auths, "year": paper.get("year"),
+                        "authors": [a.get("name","") for a in (paper.get("authors") or [])][:8],
+                        "year": paper.get("year"),
                         "journal": (venue.get("name") or "")[:200],
                         "cited_by": paper.get("citationCount", 0),
                         "concepts": [], "is_oa": bool(oa_pdf.get("url")),
                         "oa_url": oa_pdf.get("url", ""),
                         "ref_count": 0, "language": "", "source": "s2",
-                    }
-                    if _append(obj, disc, sub): new += 1
+                    }, disc, sub)
+                    new += 1
                 break
             except Exception as e:
-                log.warning(f"S2-ERR [{query[:25]}] off={offset}: {e}")
                 await asyncio.sleep(15)
         offset += 100
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.0)
     _mark_done(key)
     return new
 
-# Ana dongu
+# ── Ana döngü: BATCH'Lİ ──────────────────────────────────────
 async def run():
     _load()
     queries = load_queries()
+    total_q = len(queries)
+
+    pending_oa   = [(d,s,q) for d,s,q in queries if not _progress.get(f"OA::{d}::{s}::{q[:40]}")]
+    pending_cr   = [(d,s,q) for d,s,q in queries if not _progress.get(f"CR::{d}::{s}::{q[:40]}")]
+    pending_epmc = [(d,s,q) for d,s,q in queries if not _progress.get(f"EPMC::{d}::{s}::{q[:40]}")]
+    pending_s2   = [(d,s,q) for d,s,q in queries if not _progress.get(f"S2::{d}::{s}::{q[:40]}")]
+
     log.info(f"{'='*60}")
-    log.info(f"GitHub Actions DOI Collector — {len(queries)} sorgu x 4 kaynak")
-    log.info(f"Baslangic DOI: {len(_seen):,}")
+    log.info(f"DOI Collector — {total_q} sorgu")
+    log.info(f"Pending: OA={len(pending_oa)} CR={len(pending_cr)} EPMC={len(pending_epmc)} S2={len(pending_s2)}")
+    log.info(f"Mevcut DOI: {len(_seen):,} | Kalan sure: {int(HARD_STOP-time.time()//1)}s")
     log.info(f"{'='*60}")
 
-    OA_SEM = asyncio.Semaphore(20)
-    CR_SEM = asyncio.Semaphore(25)
-    EP_SEM = asyncio.Semaphore(15)
-    S2_SEM = asyncio.Semaphore(5)
+    OA_SEM   = asyncio.Semaphore(15)
+    CR_SEM   = asyncio.Semaphore(20)
+    EPMC_SEM = asyncio.Semaphore(10)
+    S2_SEM   = asyncio.Semaphore(4)
 
-    async def _oa(c, q, d, s):
-        async with OA_SEM: return await fetch_oa(c, q, d, s)
-    async def _cr(c, q, d, s):
-        async with CR_SEM: return await fetch_cr(c, q, d, s)
-    async def _ep(c, q, d, s):
-        async with EP_SEM: return await fetch_epmc(c, q, d, s)
-    async def _s2(c, q, d, s):
-        async with S2_SEM: return await fetch_s2(c, q, d, s)
-
-    total_new = 0
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        tasks = []
-        for disc, sub, query in queries:
-            tasks.append(_oa(client, query, disc, sub))
-            tasks.append(_cr(client, query, disc, sub))
-            tasks.append(_ep(client, query, disc, sub))
-            tasks.append(_s2(client, query, disc, sub))
+        # Batch'li calistir — her batch 50 sorgu
+        BATCH = 50
+        all_tasks = []
+        for d,s,q in pending_oa:
+            all_tasks.append(("oa", d, s, q))
+        for d,s,q in pending_cr:
+            all_tasks.append(("cr", d, s, q))
+        for d,s,q in pending_epmc:
+            all_tasks.append(("epmc", d, s, q))
+        for d,s,q in pending_s2:
+            all_tasks.append(("s2", d, s, q))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, int): total_new += r
+        for i in range(0, len(all_tasks), BATCH):
+            if not _time_ok():
+                log.info("Zaman doldu, duruyorum...")
+                break
+            batch = all_tasks[i:i+BATCH]
+            coros = []
+            for src, d, s, q in batch:
+                if src == "oa":
+                    coros.append(asyncio.wait_for(
+                        (lambda d=d,s=s,q=q: fetch_oa(client,q,d,s))(),
+                        timeout=120))
+                elif src == "cr":
+                    coros.append(asyncio.wait_for(
+                        (lambda d=d,s=s,q=q: fetch_cr(client,q,d,s))(),
+                        timeout=120))
+                elif src == "epmc":
+                    coros.append(asyncio.wait_for(
+                        (lambda d=d,s=s,q=q: fetch_epmc(client,q,d,s))(),
+                        timeout=120))
+                elif src == "s2":
+                    coros.append(asyncio.wait_for(
+                        (lambda d=d,s=s,q=q: fetch_s2(client,q,d,s))(),
+                        timeout=180))
+
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            batch_new = sum(r for r in results if isinstance(r, int))
+            log.info(f"Batch {i//BATCH+1}: +{batch_new} DOI | toplam: {len(_seen):,}")
+            _save_progress()
+            _save_summary()
 
     if _master_f:
         _master_f.close()
+    _save_progress()
+    _save_summary()
 
-    # Ozet dosya yaz
-    summary = {
-        "run_time": time.strftime("%Y-%m-%d %H:%M UTC"),
-        "total_doi": len(_seen),
-        "new_this_run": total_new,
-        "queries_run": len(queries),
-    }
-    (DATA_DIR / "summary.json").write_text(json.dumps(summary, indent=2))
-
-    log.info(f"{'='*60}")
-    log.info(f"TAMAMLANDI — Bu calisma: +{total_new:,} yeni DOI")
-    log.info(f"Toplam: {len(_seen):,} DOI")
-    log.info(f"{'='*60}")
-    print(f"\nToplam {len(_seen):,} DOI | Bu run: +{total_new:,}")
+    log.info(f"TAMAMLANDI — Bu run: +{_new_this_run:,} | Toplam: {len(_seen):,}")
 
 if __name__ == "__main__":
     asyncio.run(run())
