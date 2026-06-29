@@ -16,13 +16,13 @@ args = parser.parse_args()
 JOB_ID     = args.job_id
 TOTAL_JOBS = args.total_jobs
 
-DATA_DIR    = Path("data")
-MASTER_FILE = DATA_DIR / "_master.jsonl"
-PROGRESS    = DATA_DIR / f"progress_{JOB_ID:02d}.json"
-SUMMARY     = DATA_DIR / f"summary_{JOB_ID:02d}.json"
-LOG_FILE    = DATA_DIR / f"collector_{JOB_ID:02d}.log"
-LOCK_FILE   = DATA_DIR / f".lock_{JOB_ID:02d}"
-DATA_DIR.mkdir(exist_ok=True)
+# Her slice kendi alt klasorune yazar → git conflict olmaz
+DATA_DIR    = Path(f"data/slice_{JOB_ID:02d}")
+MASTER_FILE = DATA_DIR / "dois.jsonl"        # sadece bu slice'in DOI'leri
+PROGRESS    = DATA_DIR / "progress.json"
+SUMMARY     = DATA_DIR / "summary.json"
+LOG_FILE    = DATA_DIR / "collector.log"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 OA_EMAIL   = "emrecancerli55@gmail.com"
 OA_HEADERS = {"User-Agent": f"ZyntraResearch/3.0 (mailto:{OA_EMAIL})"}
@@ -83,11 +83,13 @@ _new_count = 0
 
 def _load():
     global _seen, _progress
+    # Bu slice'in kendi doi dosyasindan mevcut DOI'leri yukle
     if MASTER_FILE.exists():
         for line in MASTER_FILE.open(encoding="utf-8", errors="ignore"):
             try: _seen.add(json.loads(line)["doi"])
             except: pass
-        log.info(f"Mevcut DOI: {len(_seen):,}")
+        log.info(f"Bu slice mevcut DOI: {len(_seen):,}")
+    # Progress yukle
     if PROGRESS.exists():
         try: _progress = json.loads(PROGRESS.read_text())
         except: pass
