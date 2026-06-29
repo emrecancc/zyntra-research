@@ -19,7 +19,7 @@ DATA_DIR.mkdir(exist_ok=True)
 OA_EMAIL   = "emrecancerli55@gmail.com"
 OA_HEADERS = {"User-Agent": f"ZyntraResearch/3.0 (mailto:{OA_EMAIL})"}
 PER_PAGE   = 200
-MAX_PAGES  = 50
+MAX_PAGES  = 25   # her query 5000 DOI max — daha fazla query'e zaman kalsin
 
 # 23 dakika sonra dur (workflow 28dk timeout, bize 5dk commit icin kalir)
 HARD_STOP  = time.time() + 23 * 60
@@ -290,6 +290,112 @@ async def fetch_s2(client, query, disc, sub):
     _mark_done(key)
     return new
 
+# ── DOAJ ─────────────────────────────────────────────────────
+async def fetch_doaj(client, query, disc, sub):
+    if not _time_ok(): return 0
+    key = f"DOAJ::{disc}::{sub}::{query[:40]}"
+    if _progress.get(key): return 0
+    new, page = 0, 1
+    while page <= 20 and _time_ok():
+        url = (f"https://doaj.org/api/search/articles/{query.replace(' ','%20')}"
+               f"?page={page}&pageSize=100")
+        for attempt in range(3):
+            try:
+                r = await client.get(url, timeout=30)
+                if r.status_code == 429: await asyncio.sleep(20); continue
+                if r.status_code != 200: _mark_done(key); return new
+                data = r.json()
+                results = data.get("results", [])
+                if not results: _mark_done(key); return new
+                for item in results:
+                    bib = item.get("bibjson", {})
+                    idents = bib.get("identifier", [])
+                    raw = ""
+                    for id_ in idents:
+                        if id_.get("type") == "doi":
+                            raw = id_.get("id", "").strip()
+                            break
+                    if not raw: continue
+                    auths = [a.get("name","") for a in bib.get("author", [])][:8]
+                    _append({
+                        "doi": raw, "title": (bib.get("title") or "")[:500],
+                        "abstract": (bib.get("abstract") or "")[:2000],
+                        "authors": auths, "year": (bib.get("year") or None),
+                        "journal": (bib.get("journal", {}).get("title") or "")[:200],
+                        "cited_by": 0, "concepts": [],
+                        "is_oa": True, "oa_url": "",
+                        "ref_count": 0, "language": "", "source": "doaj",
+                    }, disc, sub)
+                    new += 1
+                total_pages = data.get("total", 0) // 100 + 1
+                if page >= total_pages: _mark_done(key); return new
+                break
+            except Exception as e:
+                await asyncio.sleep(10)
+        page += 1
+        await asyncio.sleep(0.3)
+    _mark_done(key)
+    return new
+
+# ── PubMed ───────────────────────────────────────────────────
+async def fetch_pubmed(client, query, disc, sub):
+    if not _time_ok(): return 0
+    key = f"PM::{disc}::{sub}::{query[:40]}"
+    if _progress.get(key): return 0
+    new = 0
+    # Adim 1: PMIDs al
+    search_url = (f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+                  f"?db=pubmed&term={query.replace(' ','+')}+AND+free+full+text[filter]"
+                  f"&retmax=500&retmode=json&tool=ZyntraResearch&email={OA_EMAIL}")
+    try:
+        r = await client.get(search_url, timeout=30)
+        if r.status_code != 200: _mark_done(key); return 0
+        pmids = r.json().get("esearchresult", {}).get("idlist", [])
+        if not pmids: _mark_done(key); return 0
+    except:
+        _mark_done(key); return 0
+
+    # Adim 2: Her 100 PMID icin DOI al
+    for i in range(0, len(pmids), 100):
+        if not _time_ok(): break
+        batch = pmids[i:i+100]
+        fetch_url = (f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                     f"?db=pubmed&id={','.join(batch)}&retmode=json"
+                     f"&tool=ZyntraResearch&email={OA_EMAIL}")
+        try:
+            r = await client.get(fetch_url, timeout=30)
+            if r.status_code != 200: continue
+            result = r.json().get("result", {})
+            for pmid in batch:
+                item = result.get(pmid, {})
+                eloc = item.get("elocationid", "")
+                raw = ""
+                if "doi:" in eloc.lower():
+                    raw = eloc.lower().replace("doi: ","").replace("doi:","").strip()
+                if not raw:
+                    for art in item.get("articleids", []):
+                        if art.get("idtype") == "doi":
+                            raw = art.get("value","").strip()
+                            break
+                if not raw: continue
+                auths = [a.get("name","") for a in item.get("authors",[])[:8]]
+                _append({
+                    "doi": raw,
+                    "title": (item.get("title") or "")[:500],
+                    "abstract": "", "authors": auths,
+                    "year": (item.get("pubdate","")[:4] or None),
+                    "journal": (item.get("fulljournalname") or "")[:200],
+                    "cited_by": 0, "concepts": [],
+                    "is_oa": True, "oa_url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    "ref_count": 0, "language": "", "source": "pubmed",
+                }, disc, sub)
+                new += 1
+        except: pass
+        await asyncio.sleep(0.4)
+
+    _mark_done(key)
+    return new
+
 # ── Ana döngü: BATCH'Lİ ──────────────────────────────────────
 async def run():
     _load()
@@ -300,31 +406,42 @@ async def run():
     pending_cr   = [(d,s,q) for d,s,q in queries if not _progress.get(f"CR::{d}::{s}::{q[:40]}")]
     pending_epmc = [(d,s,q) for d,s,q in queries if not _progress.get(f"EPMC::{d}::{s}::{q[:40]}")]
     pending_s2   = [(d,s,q) for d,s,q in queries if not _progress.get(f"S2::{d}::{s}::{q[:40]}")]
+    pending_doaj = [(d,s,q) for d,s,q in queries if not _progress.get(f"DOAJ::{d}::{s}::{q[:40]}")]
+    pending_pm   = [(d,s,q) for d,s,q in queries if not _progress.get(f"PM::{d}::{s}::{q[:40]}")]
 
     log.info(f"{'='*60}")
-    log.info(f"DOI Collector — {total_q} sorgu")
-    log.info(f"Pending: OA={len(pending_oa)} CR={len(pending_cr)} EPMC={len(pending_epmc)} S2={len(pending_s2)}")
-    log.info(f"Mevcut DOI: {len(_seen):,} | Kalan sure: {int(HARD_STOP-time.time()//1)}s")
+    log.info(f"DOI Collector v2 — {total_q} sorgu, 6 kaynak")
+    log.info(f"OA={len(pending_oa)} CR={len(pending_cr)} EPMC={len(pending_epmc)} S2={len(pending_s2)} DOAJ={len(pending_doaj)} PM={len(pending_pm)}")
+    log.info(f"Mevcut DOI: {len(_seen):,} | Kalan sure: {int(HARD_STOP-time.time()):}s")
     log.info(f"{'='*60}")
 
-    OA_SEM   = asyncio.Semaphore(15)
-    CR_SEM   = asyncio.Semaphore(20)
-    EPMC_SEM = asyncio.Semaphore(10)
-    S2_SEM   = asyncio.Semaphore(4)
+    # Tum kaynaklari interleave et — bir query'yi 6 kaynaktan ayni anda cek
+    # Siralama: OA en verimli, once o, sonra diger kaynaklar
+    all_tasks = []
+    # Once OA (en fazla DOI getiriyor)
+    for d,s,q in pending_oa:   all_tasks.append(("oa",   d, s, q))
+    # Sonra CR + EPMC (hizli)
+    for d,s,q in pending_cr:   all_tasks.append(("cr",   d, s, q))
+    for d,s,q in pending_epmc: all_tasks.append(("epmc", d, s, q))
+    # Sonra DOAJ + PubMed
+    for d,s,q in pending_doaj: all_tasks.append(("doaj", d, s, q))
+    for d,s,q in pending_pm:   all_tasks.append(("pm",   d, s, q))
+    # S2 en sonda (rate limit agir)
+    for d,s,q in pending_s2:   all_tasks.append(("s2",   d, s, q))
+
+    FETCH_MAP = {
+        "oa":   lambda c,d,s,q: fetch_oa(c,q,d,s),
+        "cr":   lambda c,d,s,q: fetch_cr(c,q,d,s),
+        "epmc": lambda c,d,s,q: fetch_epmc(c,q,d,s),
+        "doaj": lambda c,d,s,q: fetch_doaj(c,q,d,s),
+        "pm":   lambda c,d,s,q: fetch_pubmed(c,q,d,s),
+        "s2":   lambda c,d,s,q: fetch_s2(c,q,d,s),
+    }
+    TIMEOUTS = {"oa":150, "cr":120, "epmc":120, "doaj":90, "pm":120, "s2":180}
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        # Batch'li calistir — her batch 50 sorgu
-        BATCH = 50
-        all_tasks = []
-        for d,s,q in pending_oa:
-            all_tasks.append(("oa", d, s, q))
-        for d,s,q in pending_cr:
-            all_tasks.append(("cr", d, s, q))
-        for d,s,q in pending_epmc:
-            all_tasks.append(("epmc", d, s, q))
-        for d,s,q in pending_s2:
-            all_tasks.append(("s2", d, s, q))
-
+        # Batch boyutu 80 — daha fazla paralel istek
+        BATCH = 80
         for i in range(0, len(all_tasks), BATCH):
             if not _time_ok():
                 log.info("Zaman doldu, duruyorum...")
@@ -332,26 +449,15 @@ async def run():
             batch = all_tasks[i:i+BATCH]
             coros = []
             for src, d, s, q in batch:
-                if src == "oa":
-                    coros.append(asyncio.wait_for(
-                        (lambda d=d,s=s,q=q: fetch_oa(client,q,d,s))(),
-                        timeout=120))
-                elif src == "cr":
-                    coros.append(asyncio.wait_for(
-                        (lambda d=d,s=s,q=q: fetch_cr(client,q,d,s))(),
-                        timeout=120))
-                elif src == "epmc":
-                    coros.append(asyncio.wait_for(
-                        (lambda d=d,s=s,q=q: fetch_epmc(client,q,d,s))(),
-                        timeout=120))
-                elif src == "s2":
-                    coros.append(asyncio.wait_for(
-                        (lambda d=d,s=s,q=q: fetch_s2(client,q,d,s))(),
-                        timeout=180))
+                fn = FETCH_MAP[src]
+                coros.append(asyncio.wait_for(
+                    fn(client, d, s, q),
+                    timeout=TIMEOUTS[src]))
 
             results = await asyncio.gather(*coros, return_exceptions=True)
             batch_new = sum(r for r in results if isinstance(r, int))
-            log.info(f"Batch {i//BATCH+1}: +{batch_new} DOI | toplam: {len(_seen):,}")
+            log.info(f"Batch {i//BATCH+1}/{(len(all_tasks)+BATCH-1)//BATCH}: "
+                     f"+{batch_new} DOI | toplam: {len(_seen):,}")
             _save_progress()
             _save_summary()
 
