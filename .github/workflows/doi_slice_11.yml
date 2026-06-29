@@ -13,14 +13,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 28
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout slice branch
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ref: slice/11
           fetch-depth: 1
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: scripts al (main'den)
+        run: |
+          git fetch origin main --depth=1
+          git checkout origin/main -- scripts/doi_collector_slice.py
+          git checkout origin/main -- scripts/query_slices/ 2>/dev/null || true
 
       - name: Bagimliliklari kur
         run: pip install -q httpx
@@ -28,21 +36,15 @@ jobs:
       - name: DOI Collector Slice 11
         run: timeout 1380 python scripts/doi_collector_slice.py --job-id 11 --total-jobs 20 || true
 
-      - name: Commit ve push (retry)
+      - name: Push to slice/11
         run: |
           git config user.name "zyntra-bot"
           git config user.email "bot@zyntra.ai"
           git add data/slice_11/ || true
           if git diff --staged --quiet; then
-            echo "no change, skip"
-            exit 0
+            echo "no change"
+          else
+            TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/slice_11/summary.json'); print(json.loads(f.read_text()).get('new_this_run',0) if f.exists() else 0)" 2>/dev/null || echo 0)
+            git commit -m "$(date +%H%M) +${TOTAL}DOI"
+            git push origin slice/11
           fi
-          TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/slice_11/summary.json'); print(json.loads(f.read_text()).get('new_this_run',0) if f.exists() else 0)" 2>/dev/null || echo 0)
-          git commit -m "slice/11 $(date +%H%M) +${TOTAL}DOI"
-          for attempt in 1 2 3 4 5; do
-            git push && echo "push OK attempt $attempt" && exit 0
-            echo "push fail attempt $attempt, pull-rebase..."
-            git pull --rebase origin main || true
-          done
-          echo "push failed after 5 attempts"
-          exit 1
