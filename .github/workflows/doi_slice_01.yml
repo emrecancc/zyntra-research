@@ -2,7 +2,7 @@ name: DOI Collector - Slice 01
 
 on:
   schedule:
-    - cron: "3 * * * *"
+    - cron: "5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,23 +13,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 28
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (retry)
+        uses: actions/checkout@v4
         with:
-          token: ${ secrets.GITHUB_TOKEN }
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Bagimliliklari kur
         run: pip install -q httpx
+
       - name: DOI Collector Slice 01
         run: timeout 1380 python scripts/doi_collector_slice.py --job-id 1 --total-jobs 20 || true
+
       - name: Commit
         run: |
           git config user.name "zyntra-bot"
           git config user.email "bot@zyntra.ai"
           git add -A
-          if git diff --staged --quiet; then echo "no change"; else
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git pull --rebase origin main || true
             TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/summary_01.json'); print(json.loads(f.read_text()).get('total_doi',0) if f.exists() else 0)" 2>/dev/null || echo "?")
-            git commit -m "Slice 01 $(date +%Y-%m-%d-%H%M) DOI:$TOTAL"
-            git push
+            git commit -m "Slice 01 $(date +%Y-%m-%d-%H%M) DOI:$TOTAL" || true
+            git push origin main
           fi
