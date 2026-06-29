@@ -19,10 +19,11 @@ jobs:
           ref: main
           fetch-depth: 1
 
-      - name: Onceki veriyi getir
+      - name: Onceki ozeti getir (summary icin)
         run: |
-          git fetch origin slice/01 --depth=5 2>/dev/null || true
-          git checkout origin/slice/01 -- data/slice_01/ 2>/dev/null || mkdir -p data/slice_01
+          git fetch origin slice/01 --depth=1 2>/dev/null || true
+          git checkout origin/slice/01 -- data/slice_01/summary.json 2>/dev/null || true
+          mkdir -p data/slice_01
 
       - uses: actions/setup-python@v5
         with:
@@ -37,8 +38,11 @@ jobs:
         run: |
           git config user.name "zyntra-bot"
           git config user.email "bot@zyntra.ai"
-          git add data/slice_01/ || true
+          git add data/slice_01/summary.json data/slice_01/progress.json 2>/dev/null || true
+          # JSONL cok buyuyor - sadece summary/progress push et, JSONL'u gitignore et
+          echo "data/slice_01/dois.jsonl" >> .gitignore
+          git add .gitignore
           git diff --staged --quiet && exit 0
           TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/slice_01/summary.json'); print(json.loads(f.read_text()).get('new_this_run',0) if f.exists() else 0)" 2>/dev/null || echo 0)
-          git commit -m "$(date +%H%M) +${TOTAL}DOI"
+          git commit -m "$(date +%H%M) +${TOTAL}DOI slice01"
           git push --force origin HEAD:refs/heads/slice/01
