@@ -4,10 +4,6 @@ on:
   schedule:
     - cron: "9 * * * *"
   workflow_dispatch:
-    inputs:
-      force:
-        description: 'Force run'
-        required: false
 
 permissions:
   contents: write
@@ -16,42 +12,24 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 28
-
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
+          token: ${ secrets.GITHUB_TOKEN }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-httpx-3
-
       - name: Bagimliliklari kur
         run: pip install -q httpx
-
-      - name: DOI Collector Slice 03 calistir
+      - name: DOI Collector Slice 03
         run: timeout 1380 python scripts/doi_collector_slice.py --job-id 3 --total-jobs 20 || true
-
-      - name: Sonuclari commit et
+      - name: Commit
         run: |
           git config user.name "zyntra-bot"
           git config user.email "bot@zyntra.ai"
           git add -A
-          if git diff --staged --quiet; then
-            echo "Degisiklik yok"
-          else
-            TOTAL=$(python3 -c "
-import json, pathlib
-f = pathlib.Path('data/summary_03.json')
-d = json.loads(f.read_text()) if f.exists() else {}
-print(d.get('total_doi', 0))
-" 2>/dev/null || echo "?")
-            git commit -m "Slice 03 | $(date +%Y-%m-%d-%H%M) | DOI: $TOTAL"
+          if git diff --staged --quiet; then echo "no change"; else
+            TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/summary_03.json'); print(json.loads(f.read_text()).get('total_doi',0) if f.exists() else 0)" 2>/dev/null || echo "?")
+            git commit -m "Slice 03 $(date +%Y-%m-%d-%H%M) DOI:$TOTAL"
             git push
           fi
