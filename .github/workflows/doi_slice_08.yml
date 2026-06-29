@@ -13,22 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 28
     steps:
-      - name: Checkout slice branch
+      - name: Checkout main (scripts + query_slices)
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ref: slice/08
+          ref: main
           fetch-depth: 1
+          sparse-checkout: |
+            scripts/
+            .github/
+
+      - name: Fetch and merge slice data
+        run: |
+          git fetch origin slice/08 --depth=50 2>/dev/null || true
+          git checkout origin/slice/08 -- data/slice_08/ 2>/dev/null || true
+          mkdir -p data/slice_08
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: scripts al (main'den)
-        run: |
-          git fetch origin main --depth=1
-          git checkout origin/main -- scripts/doi_collector_slice.py
-          git checkout origin/main -- scripts/query_slices/ 2>/dev/null || true
 
       - name: Bagimliliklari kur
         run: pip install -q httpx
@@ -43,8 +46,8 @@ jobs:
           git add data/slice_08/ || true
           if git diff --staged --quiet; then
             echo "no change"
-          else
-            TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/slice_08/summary.json'); print(json.loads(f.read_text()).get('new_this_run',0) if f.exists() else 0)" 2>/dev/null || echo 0)
-            git commit -m "$(date +%H%M) +${TOTAL}DOI"
-            git push origin slice/08
+            exit 0
           fi
+          TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/slice_08/summary.json'); print(json.loads(f.read_text()).get('new_this_run',0) if f.exists() else 0)" 2>/dev/null || echo 0)
+          git commit -m "$(date +%H%M) +${TOTAL}DOI"
+          git push origin HEAD:slice/08
