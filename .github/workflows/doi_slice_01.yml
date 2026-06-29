@@ -1,0 +1,57 @@
+name: DOI Collector - Slice 01
+
+on:
+  schedule:
+    - cron: "3 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force run'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 28
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-httpx-1
+
+      - name: Bagimliliklari kur
+        run: pip install -q httpx
+
+      - name: DOI Collector Slice 01 calistir
+        run: timeout 1380 python scripts/doi_collector_slice.py --job-id 1 --total-jobs 20 || true
+
+      - name: Sonuclari commit et
+        run: |
+          git config user.name "zyntra-bot"
+          git config user.email "bot@zyntra.ai"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "Degisiklik yok"
+          else
+            TOTAL=$(python3 -c "
+import json, pathlib
+f = pathlib.Path('data/summary_01.json')
+d = json.loads(f.read_text()) if f.exists() else {}
+print(d.get('total_doi', 0))
+" 2>/dev/null || echo "?")
+            git commit -m "Slice 01 | $(date +%Y-%m-%d-%H%M) | DOI: $TOTAL"
+            git push
+          fi
