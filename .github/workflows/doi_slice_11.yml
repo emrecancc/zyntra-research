@@ -13,13 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 28
     steps:
-      - name: Checkout (retry)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -31,16 +29,19 @@ jobs:
       - name: DOI Collector Slice 11
         run: timeout 1380 python scripts/doi_collector_slice.py --job-id 11 --total-jobs 20 || true
 
-      - name: Commit
+      - name: Commit (conflict-free)
         run: |
           git config user.name "zyntra-bot"
           git config user.email "bot@zyntra.ai"
-          git add -A
+          git add data/slice_11/ || true
           if git diff --staged --quiet; then
             echo "no change"
           else
+            TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/slice_11/summary.json'); print(json.loads(f.read_text()).get('new_this_run',0) if f.exists() else 0)" 2>/dev/null || echo "?")
+            git stash
             git pull --rebase origin main || true
-            TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/summary_11.json'); print(json.loads(f.read_text()).get('total_doi',0) if f.exists() else 0)" 2>/dev/null || echo "?")
-            git commit -m "Slice 11 $(date +%Y-%m-%d-%H%M) DOI:$TOTAL" || true
+            git stash pop || true
+            git add data/slice_11/
+            git commit -m "Slice 11 $(date +%H%M) +${TOTAL}DOI" || true
             git push origin main
           fi
