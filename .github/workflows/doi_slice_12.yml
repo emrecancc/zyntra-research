@@ -13,11 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 28
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -29,19 +28,17 @@ jobs:
       - name: DOI Collector Slice 12
         run: timeout 1380 python scripts/doi_collector_slice.py --job-id 12 --total-jobs 20 || true
 
-      - name: Commit (conflict-free)
+      - name: Push to slice branch
         run: |
           git config user.name "zyntra-bot"
           git config user.email "bot@zyntra.ai"
+          BRANCH="slice/12"
+          git checkout -B "$BRANCH"
           git add data/slice_12/ || true
           if git diff --staged --quiet; then
             echo "no change"
           else
             TOTAL=$(python3 -c "import json,pathlib; f=pathlib.Path('data/slice_12/summary.json'); print(json.loads(f.read_text()).get('new_this_run',0) if f.exists() else 0)" 2>/dev/null || echo "?")
-            git stash
-            git pull --rebase origin main || true
-            git stash pop || true
-            git add data/slice_12/
-            git commit -m "Slice 12 $(date +%H%M) +${TOTAL}DOI" || true
-            git push origin main
+            git commit -m "slice/12 $(date +%H%M) +${TOTAL}DOI"
+            git push origin "$BRANCH" --force
           fi
