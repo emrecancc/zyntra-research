@@ -1,8 +1,8 @@
 {
   "job_id": 8,
-  "run_time": "2026-06-29 03:02 UTC",
-  "total_doi": 36500,
-  "new_this_run": 36500,
-  "queries_done": 179,
-  "queries_total": 179
+  "run_time": "2026-09-06 19:40 UTC",
+  "total_doi": 118571,
+  "new_this_run": 82000,
+  "queries_done": 265,
+  "queries_total": 265
 }
